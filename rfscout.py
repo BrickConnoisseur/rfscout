@@ -11,7 +11,7 @@ Usage:
   python3 rfscout.py           # live SDR
   python3 rfscout.py --mock    # fake sweep data (test the AI side without the SDR)
 """
-import argparse, csv, json, os, re, shutil, statistics, subprocess, sys, time, urllib.request
+import argparse, csv, json, os, re, shutil, subprocess, sys, time, urllib.request
 
 HOME = os.path.expanduser("~/rfscout")
 MODEL = os.path.join(HOME, "models", "model.gguf")
@@ -41,6 +41,7 @@ BANDS = [
     (118.0, 137.0, "Aviation voice", "pilots talking to air traffic control"),
     (137.0, 138.0, "Weather satellites", "NOAA and Meteor satellites sending weather images"),
     (144.0, 148.0, "2 m amateur radio", "licensed ham radio operators"),
+    (148.0, 150.8, "Federal/military VHF", "government and military radio and satellite uplinks"),
     (156.0, 162.0, "Marine VHF", "boats and harbor communications"),
     (150.8, 174.0, "VHF land mobile", "public safety, business, and utility radios"),
     (420.0, 450.0, "70 cm amateur radio", "licensed ham radio operators"),
@@ -75,6 +76,13 @@ def sweep(lo, hi, binw, mock=False):
     """Return list of (freq_MHz, power_dB). Never falls back to fake data silently."""
     if mock:
         return mock_sweep(lo, hi)
+    for attempt in range(3):              # first sweep after startup sometimes returns nothing
+        pts = _sweep_once(lo, hi, binw)
+        if pts: return pts
+        time.sleep(1)
+    return []
+
+def _sweep_once(lo, hi, binw):
     out = "/tmp/rfscout_sweep.csv"
     if os.path.exists(out): os.remove(out)
     cmd = ["rtl_power", "-f", f"{lo}M:{hi}M:{binw}", "-i", "1", "-g", GAIN, "-1", out]
@@ -102,7 +110,7 @@ def mock_sweep(lo, hi):
     fake = [162.400, 162.550, 94.5, 98.7, 102.1, 433.92, 315.0, 121.5]
     for fc in fake:
         if lo <= fc <= hi:
-            pts = [(f, p + max(0, 25 - abs(f - fc) * 400)) for f, p in pts]
+            pts = [(f, p + max(0, 25 - abs(f - fc) * (4000 if hi - lo < 2 else 400))) for f, p in pts]
     return pts
 
 def find_peaks(pts, margin=MARGIN_DB, top=5, min_sep=0.05):
@@ -157,9 +165,9 @@ def peak_mem_mb():
         return None
 
 SYSTEM = ("You are RFScout, a radio assistant running offline on a small device. "
-          "Summarize the scan for a non-expert in 1 or 2 short sentences. "
-          "Only use the facts given. Do not invent frequencies or stations. "
-          "Do not repeat the facts word for word and do not repeat yourself.")
+          "Write ONE short sentence for a non-expert saying how many signals were found "
+          "and what the strongest one is used for. Use MHz. Copy numbers exactly from the facts. "
+          "Do not invent anything.")
 
 def dedupe(text):
     """Safety net for small models: drop repeated lines/sentences."""
@@ -170,18 +178,47 @@ def dedupe(text):
             seen.add(key); out.append(line.strip())
     return " ".join(out)
 
-def explain(facts):
+BAD_WORDS = ("ghz", "khz", "decod", " am ", "am/fm", "amplitude", "interfer", "amateur")
+
+def grounded(text, facts):
+    """Reject replies that use wrong units, claim decoding, or cite numbers not in the facts."""
+    t = " " + text.lower() + " "
+    if any(w in t for w in BAD_WORDS): return False
+    fact_nums = {float(x) for x in re.findall(r"\d+(?:\.\d+)?", facts)}
+    for x in re.findall(r"\d+(?:\.\d+)?", text):
+        v = float(x)
+        if v < 10: continue                       # small counts like "2 signals" are fine
+        if not any(abs(v - n) <= 0.05 for n in fact_nums): return False
+    return True
+
+def template(facts):
+    """Deterministic summary built straight from the facts (used if the model drifts)."""
+    sigs = re.findall(r"- ([\d.]+) MHz, (\d+) dB above noise: ([^(]+)", facts)
+    if not sigs: return "No signals stood out in this scan."
+    f, db, name = sigs[0]
+    return (f"Found {len(sigs)} signal{'s' if len(sigs) > 1 else ''}. "
+            f"Strongest is {float(f):.1f} MHz, {db} dB above the noise floor ({name.strip()}).")
+
+def explain_full(facts):
+    """Ask the local model. Returns dict(text, latency, tps, checked) - checked=False means fallback used."""
     body = json.dumps({
         "messages": [{"role": "system", "content": SYSTEM},
                      {"role": "user", "content": facts}],
-        "max_tokens": 120, "temperature": 0.2, "repeat_penalty": 1.3}).encode()
+        "max_tokens": 120, "temperature": 0.1, "repeat_penalty": 1.3}).encode()
     t0 = time.time()
     req = urllib.request.Request(URL + "/v1/chat/completions", body, {"Content-Type": "application/json"})
     r = json.loads(urllib.request.urlopen(req, timeout=180).read())
     dt = time.time() - t0
     text = dedupe(r["choices"][0]["message"]["content"].strip())
     tps = r.get("timings", {}).get("predicted_per_second")
-    return text, dt, tps
+    ok = grounded(text, facts)
+    return {"text": text if ok else template(facts), "latency": dt, "tps": tps, "checked": ok, "raw": text}
+
+def explain(facts):
+    res = explain_full(facts)
+    if not res["checked"]:
+        print(col("  [AI reply failed fact check, using verified summary]", "y"))
+    return res["text"], res["latency"], res["tps"]
 
 def log_metric(query, latency, tps):
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -242,23 +279,72 @@ def binwidth_for(lo, hi):
     k = max(5.0, (hi - lo) * 1000 / 400)
     return f"{k:g}k" if k < 1000 else f"{k/1000:g}M"
 
-def run_scan(label, lo, hi, binw, mock):
-    """Returns (facts, n_peaks). facts is None if the SDR returned nothing."""
-    print(col(f"  [sweeping {lo:.3f}–{hi:.3f} MHz ...]", "d"))
-    pts = sweep(lo, hi, binw, mock)
+import threading
+SDR_LOCK = threading.Lock()   # one rtl_power at a time (web UI is multi-threaded)
+
+def analyze(label, lo, hi, binw, mock):
+    """Sweep + detect. Returns a dict the UIs can draw. ok=False means the SDR gave no data."""
+    with SDR_LOCK:
+        pts = sweep(lo, hi, binw, mock)
     min_sep = 0.15 if hi - lo > 5 else 0.02     # FM stations are ~200 kHz wide
     peaks, floor = find_peaks(pts, min_sep=min_sep)
-    if floor is None:
+    res = {"label": label, "lo": lo, "hi": hi, "points": pts, "floor": floor, "ok": floor is not None,
+           "peaks": [{"freq": f, "db": p - floor, "band": lookup(f)[0], "desc": lookup(f)[1]} for f, p in peaks]}
+    if not res["ok"]:
+        res["facts"] = None
+    elif not peaks:
+        res["facts"] = f"Scan of {label} ({lo:g}-{hi:g} MHz): no signals above the noise floor."
+    else:
+        res["facts"] = (f"Scan of {label} ({lo:g}-{hi:g} MHz) found these signals:\n" +
+                        "\n".join(f"- {k['freq']:.3f} MHz, {k['db']:.0f} dB above noise: {k['band']} ({k['desc']})"
+                                   for k in res["peaks"]))
+    return res
+
+def plan(r):
+    """Turn a routed command into scan jobs. Returns dict(scans, prefix, empty, note) or None."""
+    if r[0] == "preset":
+        lo, hi, binw, label = PRESETS[r[1]]
+        return {"scans": [(label, lo, hi, binw)], "prefix": "", "note": None,
+                "empty": f"No signals stood out in {label} ({lo:g}-{hi:g} MHz)."}
+    if r[0] == "range":
+        lo, hi = r[1], r[2]
+        return {"scans": [(f"{lo:g}-{hi:g} MHz", lo, hi, binwidth_for(lo, hi))], "prefix": "", "note": None,
+                "empty": f"No signals stood out between {lo:g} and {hi:g} MHz."}
+    if r[0] == "freq":
+        mhz = r[1]; name, desc = lookup(mhz)
+        return {"scans": [(name, max(24.0, mhz - 0.5), min(1766.0, mhz + 0.5), "5k")],
+                "prefix": f"Frequency of interest: {mhz:g} MHz, in the {name} band ({desc}).\n",
+                "note": f"{mhz:g} MHz is in: {name} — {desc}",
+                "empty": f"Nothing active near {mhz:g} MHz right now. That frequency is in the {name} band, used for {desc}."}
+    if r[0] == "disaster":
+        return {"scans": [("NOAA Weather Radio", 162.35, 162.60, "5k"), ("FM broadcast", 88.0, 108.0, "50k")],
+                "prefix": "Emergency check. Say which of these information sources have signals present. "
+                          "Do not claim any alert or message was decoded.\n",
+                "note": "DISASTER MODE: checking emergency broadcast channels",
+                "empty": "No NOAA Weather Radio or FM broadcast signals detected. Check the antenna and location."}
+    return None
+
+def ensure_server():
+    """Reuse a running llama-server if there is one, else start it. Returns load seconds (0 if reused)."""
+    try:
+        if urllib.request.urlopen(URL + "/health", timeout=1).status == 200:
+            return 0.0
+    except Exception:
+        pass
+    return start_server()
+
+def run_scan(label, lo, hi, binw, mock):
+    """CLI: print one scan. Returns (facts, n_peaks); facts None if the SDR returned nothing."""
+    print(col(f"  [sweeping {lo:.3f}–{hi:.3f} MHz ...]", "d"))
+    res = analyze(label, lo, hi, binw, mock)
+    if not res["ok"]:
         print(col("  no data from SDR (is it plugged in?)", "r")); return None, 0
-    if not peaks:
-        print(f"  nothing above the noise floor ({floor:.1f} dB)")
-        return f"Scan of {label} ({lo:g}-{hi:g} MHz): no signals above the noise floor.", 0
-    bars(peaks, floor)
-    lines = []
-    for f, p in peaks:
-        name, desc = lookup(f)
-        lines.append(f"- {f:.3f} MHz, {p - floor:.0f} dB above noise: {name} ({desc})")
-    return f"Scan of {label} ({lo:g}-{hi:g} MHz) found these signals:\n" + "\n".join(lines), len(peaks)
+    if not res["peaks"]:
+        print(f"  nothing above the noise floor ({res['floor']:.1f} dB)")
+    for k in res["peaks"]:
+        n = max(1, int(k["db"] / 1.5))
+        print(f"  {k['freq']:9.3f} MHz |{col('█' * min(n, 30), 'g')} +{k['db']:4.0f} dB  {col('← ' + k['band'], 'd')}")
+    return res["facts"], len(res["peaks"])
 
 def answer(facts, query):
     text, dt, tps = explain(facts)
@@ -297,37 +383,17 @@ def main():
                 print(f"  model: {os.path.basename(MODEL)}  load: {load_s:.1f}s  peak mem: {peak_mem_mb() or 0:.0f} MB")
             elif r[0] == "badfreq":
                 print(f"  {r[1]:g} MHz is outside the RTL-SDR range (24–1766 MHz).")
-            elif r[0] == "preset":
-                lo, hi, binw, label = PRESETS[r[1]]
-                facts, n = run_scan(label, lo, hi, binw, mock)
-                if facts is None: continue
-                if n: answer(facts, q)
-                else: say(f"No signals stood out in {label} ({lo:g}-{hi:g} MHz).")
-            elif r[0] == "range":
-                lo, hi = r[1], r[2]
-                label = f"{lo:g}-{hi:g} MHz"
-                facts, n = run_scan(label, lo, hi, binwidth_for(lo, hi), mock)
-                if facts is None: continue
-                if n: answer(facts, q)
-                else: say(f"No signals stood out between {lo:g} and {hi:g} MHz.")
-            elif r[0] == "freq":
-                mhz = r[1]
-                name, desc = lookup(mhz)
-                print(f"  {mhz:g} MHz is in: {col(name, 'y')} — {desc}")
-                facts, n = run_scan(name, max(24.0, mhz - 0.5), min(1766.0, mhz + 0.5), "5k", mock)
-                if facts is None: continue
-                if n: answer(f"Frequency of interest: {mhz:g} MHz, in the {name} band ({desc}).\n" + facts, q)
-                else: say(f"Nothing active near {mhz:g} MHz right now. That frequency is in the {name} band, used for {desc}.")
-            elif r[0] == "disaster":
-                print(col("  DISASTER MODE: checking emergency broadcast channels", "r"))
-                f1, n1 = run_scan("NOAA Weather Radio", 162.35, 162.60, "5k", mock)
-                f2, n2 = run_scan("FM broadcast", 88.0, 108.0, "50k", mock)
-                if not (n1 or n2):
-                    say("No NOAA Weather Radio or FM broadcast signals detected. Check the antenna and location.")
-                    continue
-                answer("Emergency check. Say which of these information sources have signals present. "
-                       "Do not claim any alert or message was decoded.\n"
-                       + (f1 or "") + "\n" + (f2 or ""), q)
+            else:
+                job = plan(r)
+                if job["note"]: print(col("  " + job["note"], "r" if r[0] == "disaster" else "y"))
+                facts, total, failed = [], 0, False
+                for scan in job["scans"]:
+                    f, n = run_scan(*scan, mock)
+                    if f is None: failed = True; continue
+                    facts.append(f); total += n
+                if not facts: continue
+                if total: answer(job["prefix"] + "\n".join(facts), q)
+                else: say(job["empty"])
     finally:
         if server_proc: server_proc.terminate()
 
