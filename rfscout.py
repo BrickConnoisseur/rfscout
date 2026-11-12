@@ -398,6 +398,12 @@ def show(text, dt, tps):
     print(col(f"  [{dt:.1f}s" + (f", {tps:.1f} tok/s" if tps else "") + "]", "d"))
 
 def answer_rf(facts, query):
+    if "no signals above the noise floor" in facts and "Strongest:" not in facts:
+        # nothing was detected: answer from code, never let the model invent a signal
+        print(col("RFScout: ", "c") + "No signals above the noise floor right now. The band is quiet.")
+        print(col("  [answered by code, no model call]", "d"))
+        log_metric("rf-empty", query, "no signals", 0.0, None)
+        return
     text, dt, tps = llm(SYS_RF, facts, examples=RF_EXAMPLE)
     show(text, dt, tps)
     log_metric("rf", query, text, dt, tps)
