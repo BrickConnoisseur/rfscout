@@ -548,8 +548,69 @@ def run_scan(label, lo, hi, binw, mock):
         lines.append(f"- {f:.3f} MHz, {p - floor:.0f} dB above noise: {name} ({desc})")
     return f"Scan of {label} ({lo}-{hi} MHz) found these signals:\n" + "\n".join(lines)
 
-def main():
+def confirm(prompt):
+    """Ask before any action that changes hardware state. The dashboard replaces this."""
+    return input(f"  {prompt} [y/N] ").strip().lower() == "y"
+
+def dispatch(r, q, mock, notes):
+    """Run one routed command. Returns False when the user quits."""
     global SDR_GAIN
+    if r[0] == "quit": return False
+    elif r[0] == "help": print(HELP)
+    elif r[0] == "bands":
+        for lo, hi, name, _ in BANDS: print(f"  {lo:8.3f}–{hi:8.3f} MHz  {name}")
+    elif r[0] == "status": print_status(mock)
+    elif r[0] == "selftest": selftest()
+    elif r[0] == "bench": bench()
+    elif r[0] == "evidence": write_evidence(mock)
+    elif r[0] == "gain":
+        g = max(0, min(49, r[1]))
+        if confirm(f"Change SDR gain {SDR_GAIN} -> {g} dB?"):
+            SDR_GAIN = g; print(f"  gain set to {g} dB")
+        else:
+            print("  cancelled")
+    elif r[0] == "export": export_last()
+    elif r[0] == "antenna": antenna(r[1])
+    elif r[0] == "fspl": fspl(r[1], r[2])
+    elif r[0] == "dbm": dbm_convert(r[1])
+    elif r[0] == "measure":
+        m = measure(r[1], mock)
+        if m and m["snr"] >= 10:
+            name, desc = lookup(m["peak"])
+            answer_rf(f"Measured a signal at {m['peak']:.4f} MHz in the {name} band ({desc}). "
+                      f"SNR {m['snr']:.0f} dB, -3 dB bandwidth {m['bw3']:.1f} kHz, "
+                      f"offset {m['off']:+.1f} kHz from {m['target']} MHz. "
+                      "Explain what this signal likely is and what the bandwidth suggests.", q)
+    elif r[0] == "occupancy":
+        rows = occupancy(r[1], mock)
+        if rows:
+            lo, hi, _, label = PRESETS[r[1]]
+            facts = "\n".join(f"- {ch:.3f} MHz active in {s} of {n} sweeps ({lookup(ch)[0]})" for ch, s, n in rows)
+            answer_rf(f"Channel occupancy over repeated sweeps of {label}:\n{facts}\n"
+                      "Explain which channels are continuous broadcasters and which are intermittent.", q)
+    elif r[0] == "badfreq":
+        print(f"  {r[1]} MHz is outside the RTL-SDR range (24–1766 MHz).")
+    elif r[0] == "preset":
+        lo, hi, binw, label = PRESETS[r[1]]
+        facts = run_scan(label, lo, hi, binw, mock)
+        if facts: answer_rf(facts, q)
+    elif r[0] == "freq":
+        mhz = r[1]
+        name, desc = lookup(mhz)
+        print(f"  {mhz} MHz is in: {col(name, 'y')} — {desc}")
+        facts = run_scan(name, mhz - 0.5, mhz + 0.5, "5k", mock)
+        if facts: answer_rf(f"User asked about {mhz} MHz ({name}: {desc}).\n" + facts, q)
+    elif r[0] == "disaster":
+        print(col("  EMERGENCY MODE: checking broadcast sources that work when internet is down", "r"))
+        f1 = run_scan("NOAA Weather Radio", 162.35, 162.60, "5k", mock) or ""
+        f2 = run_scan("FM broadcast", 88.0, 108.0, "50k", mock) or ""
+        answer_rf("Emergency check. Tell the user which emergency info sources are on the air.\n"
+                  + f1 + "\n" + f2, q)
+    elif r[0] == "general":
+        answer_general(q, notes)
+    return True
+
+def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mock", action="store_true", help="use fake sweep data")
     a = ap.parse_args()
@@ -569,61 +630,8 @@ def main():
         while True:
             try: q = input(col("\nRFScout > ", "g"))
             except EOFError: break
-            r = route(q)
             try:
-                if r[0] == "quit": break
-                elif r[0] == "help": print(HELP)
-                elif r[0] == "bands":
-                    for lo, hi, name, _ in BANDS: print(f"  {lo:8.3f}–{hi:8.3f} MHz  {name}")
-                elif r[0] == "status": print_status(mock)
-                elif r[0] == "selftest": selftest()
-                elif r[0] == "bench": bench()
-                elif r[0] == "evidence": write_evidence(mock)
-                elif r[0] == "gain":
-                    g = max(0, min(49, r[1]))
-                    if input(f"  Change SDR gain {SDR_GAIN} -> {g} dB? [y/N] ").strip().lower() == "y":
-                        SDR_GAIN = g; print(f"  gain set to {g} dB")
-                    else:
-                        print("  cancelled")
-                elif r[0] == "export": export_last()
-                elif r[0] == "antenna": antenna(r[1])
-                elif r[0] == "fspl": fspl(r[1], r[2])
-                elif r[0] == "dbm": dbm_convert(r[1])
-                elif r[0] == "measure":
-                    m = measure(r[1], mock)
-                    if m and m["snr"] >= 10:
-                        name, desc = lookup(m["peak"])
-                        answer_rf(f"Measured a signal at {m['peak']:.4f} MHz in the {name} band ({desc}). "
-                                  f"SNR {m['snr']:.0f} dB, -3 dB bandwidth {m['bw3']:.1f} kHz, "
-                                  f"offset {m['off']:+.1f} kHz from {m['target']} MHz. "
-                                  "Explain what this signal likely is and what the bandwidth suggests.", q)
-                elif r[0] == "occupancy":
-                    rows = occupancy(r[1], mock)
-                    if rows:
-                        lo, hi, _, label = PRESETS[r[1]]
-                        facts = "\n".join(f"- {ch:.3f} MHz active in {s} of {n} sweeps ({lookup(ch)[0]})" for ch, s, n in rows)
-                        answer_rf(f"Channel occupancy over repeated sweeps of {label}:\n{facts}\n"
-                                  "Explain which channels are continuous broadcasters and which are intermittent.", q)
-                elif r[0] == "badfreq":
-                    print(f"  {r[1]} MHz is outside the RTL-SDR range (24–1766 MHz).")
-                elif r[0] == "preset":
-                    lo, hi, binw, label = PRESETS[r[1]]
-                    facts = run_scan(label, lo, hi, binw, mock)
-                    if facts: answer_rf(facts, q)
-                elif r[0] == "freq":
-                    mhz = r[1]
-                    name, desc = lookup(mhz)
-                    print(f"  {mhz} MHz is in: {col(name, 'y')} — {desc}")
-                    facts = run_scan(name, mhz - 0.5, mhz + 0.5, "5k", mock)
-                    if facts: answer_rf(f"User asked about {mhz} MHz ({name}: {desc}).\n" + facts, q)
-                elif r[0] == "disaster":
-                    print(col("  EMERGENCY MODE: checking broadcast sources that work when internet is down", "r"))
-                    f1 = run_scan("NOAA Weather Radio", 162.35, 162.60, "5k", mock) or ""
-                    f2 = run_scan("FM broadcast", 88.0, 108.0, "50k", mock) or ""
-                    answer_rf("Emergency check. Tell the user which emergency info sources are on the air.\n"
-                              + f1 + "\n" + f2, q)
-                elif r[0] == "general":
-                    answer_general(q, notes)
+                if not dispatch(route(q), q, mock, notes): break
             except KeyboardInterrupt:
                 print(col("  cancelled", "d"))
             except Exception as e:
