@@ -66,10 +66,10 @@ def lookup(mhz):
 # ---------- scan presets ----------
 PRESETS = {
     "fm":    (88.0, 108.0, "50k",  "FM broadcast"),
-    "noaa":  (162.35, 162.60, "5k", "NOAA Weather Radio"),
+    "noaa":  (162.335, 162.640, "5k", "NOAA Weather Radio"),
     "air":   (118.0, 137.0, "25k", "Aviation voice"),
     "ism433":(433.0, 434.9, "10k", "433 MHz ISM"),
-    "fob":   (314.5, 315.5, "5k",  "315 MHz key fobs"),
+    "fob":   (314.6, 315.6, "5k",  "315 MHz key fobs"),
     "frs":   (462.5, 467.8, "12.5k", "FRS/GMRS"),
     "ism915":(902.0, 928.0, "100k", "915 MHz ISM"),
 }
@@ -152,11 +152,28 @@ def sweep(lo, hi, binw, mock=False):
         for row in csv.reader(f):
             if len(row) < 7: continue
             f_lo, step = float(row[2]), float(row[4])
-            for i, v in enumerate(row[6:]):
-                try: pts.append(((f_lo + i * step) / 1e6, float(v)))
-                except ValueError: pass
+            vals = []
+            for v in row[6:]:
+                try: vals.append(float(v))
+                except ValueError: vals.append(None)
+            remove_dc_spike(vals, step)
+            for i, v in enumerate(vals):
+                if v is not None: pts.append(((f_lo + i * step) / 1e6, v))
     pts.sort()
     return pts
+
+def remove_dc_spike(vals, step_hz):
+    """The RTL-SDR shows a false spike at the exact frequency it is tuned to (the middle of
+    each rtl_power hop). Replace those few bins with the median of their neighbors."""
+    n = len(vals)
+    if n < 12: return
+    mid = n // 2
+    w = max(1, round(3000 / max(step_hz, 1)))
+    lo, hi = max(0, mid - w), min(n, mid + w + 1)
+    nb = [v for v in vals[max(0, lo - 6):lo] + vals[hi:hi + 6] if v is not None]
+    if nb:
+        fill = statistics.median(nb)
+        for i in range(lo, hi): vals[i] = fill
 
 def mock_sweep(lo, hi):
     import random
@@ -188,8 +205,8 @@ LAST = {"pts": [], "label": None}
 # ---------- EE measurement tools (all math done in code, not by the model) ----------
 def measure(mhz, mock):
     """Peak frequency, relative power, SNR, -3/-10 dB bandwidth, frequency offset and ppm error."""
-    span, binw = 0.25, "1k"
-    pts = sweep(mhz - span, mhz + span, binw, mock)
+    binw = "1k"
+    pts = sweep(mhz - 0.2, mhz + 0.3, binw, mock)        # tuned 50 kHz above target, away from the spike
     LAST["pts"], LAST["label"] = pts, f"measure_{mhz}"
     if not pts: return None
     floor = statistics.median(p for _, p in pts)
@@ -331,21 +348,35 @@ def peak_mem_mb():
         return None
 
 SYS_RF = ("You are RFScout, a radio assistant running offline on a small device. "
-          "Explain radio scan results to a non-expert in 2 short sentences. "
-          "Only use the facts given. Do not invent frequencies or stations.")
+          "Summarize the scan for a non-expert in at most 2 short sentences. "
+          "Do not repeat the list. Only use the facts given. Do not invent frequencies or stations.")
+RF_EXAMPLE = [
+    {"role": "user", "content": "Scan of FM broadcast: 3 signals. Strongest: 96.300 MHz (FM broadcast radio, 24 dB above noise); "
+                                "101.100 MHz (FM broadcast radio, 18 dB above noise). FM broadcast radio is used for commercial and public FM radio stations."},
+    {"role": "assistant", "content": "I found 3 FM radio stations on the air, and the strongest is at 96.3 MHz. "
+                                     "These are ordinary commercial or public radio broadcasts."},
+]
+
+def clean(text):
+    """Keep the model's answer short: drop echoed list lines and stop after 2 sentences."""
+    lines = [l.strip() for l in text.splitlines() if l.strip() and not l.strip().startswith(("-", "*", "•"))]
+    text = " ".join(lines)
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    out = " ".join(parts[:2]).strip()
+    return out if out else text.strip()
 SYS_GENERAL = ("You are RFScout, a helpful assistant running fully offline on a TI SK-AM62B edge computer. "
                "Answer briefly and follow the user's instructions exactly.")
 
-def llm(system, user, max_tokens=80):
+def llm(system, user, max_tokens=60, examples=None):
+    msgs = [{"role": "system", "content": system}] + (examples or []) + [{"role": "user", "content": user}]
     body = json.dumps({
-        "messages": [{"role": "system", "content": system},
-                     {"role": "user", "content": user}],
-        "max_tokens": max_tokens, "temperature": 0.2}).encode()
+        "messages": msgs, "max_tokens": max_tokens, "temperature": 0.2,
+        "stop": ["\n\n", "\n-", "\nUser", "\nScan of"]}).encode()
     t0 = time.time()
     req = urllib.request.Request(URL + "/v1/chat/completions", body, {"Content-Type": "application/json"})
     r = json.loads(urllib.request.urlopen(req, timeout=180).read())
     dt = time.time() - t0
-    text = r["choices"][0]["message"]["content"].strip()
+    text = clean(r["choices"][0]["message"]["content"])
     tps = r.get("timings", {}).get("predicted_per_second")
     STATE["latencies"].append(dt)
     if tps: STATE["tps"].append(tps)
@@ -367,7 +398,7 @@ def show(text, dt, tps):
     print(col(f"  [{dt:.1f}s" + (f", {tps:.1f} tok/s" if tps else "") + "]", "d"))
 
 def answer_rf(facts, query):
-    text, dt, tps = llm(SYS_RF, facts)
+    text, dt, tps = llm(SYS_RF, facts, examples=RF_EXAMPLE)
     show(text, dt, tps)
     log_metric("rf", query, text, dt, tps)
 
@@ -542,11 +573,14 @@ def run_scan(label, lo, hi, binw, mock):
         print(f"  nothing above the noise floor ({floor:.1f} dB)")
         return f"Scan of {label} ({lo}-{hi} MHz): no signals above the noise floor."
     bars(peaks, floor)
-    lines = []
-    for f, p in peaks:
+    lines, notes = [], {}
+    for f, p in peaks[:3]:
         name, desc = lookup(f)
-        lines.append(f"- {f:.3f} MHz, {p - floor:.0f} dB above noise: {name} ({desc})")
-    return f"Scan of {label} ({lo}-{hi} MHz) found these signals:\n" + "\n".join(lines)
+        lines.append(f"{f:.3f} MHz ({name}, {p - floor:.0f} dB above noise)")
+        notes[name] = desc
+    more = f" plus {len(peaks) - 3} weaker" if len(peaks) > 3 else ""
+    return (f"Scan of {label}: {len(peaks)} signals. Strongest: " + "; ".join(lines) + ". "
+            + " ".join(f"{k} is used for {v}." for k, v in notes.items()))
 
 def confirm(prompt):
     """Ask before any action that changes hardware state. The dashboard replaces this."""
@@ -598,11 +632,11 @@ def dispatch(r, q, mock, notes):
         mhz = r[1]
         name, desc = lookup(mhz)
         print(f"  {mhz} MHz is in: {col(name, 'y')} — {desc}")
-        facts = run_scan(name, mhz - 0.5, mhz + 0.5, "5k", mock)
+        facts = run_scan(name, mhz - 0.4, mhz + 0.6, "5k", mock)
         if facts: answer_rf(f"User asked about {mhz} MHz ({name}: {desc}).\n" + facts, q)
     elif r[0] == "disaster":
         print(col("  EMERGENCY MODE: checking broadcast sources that work when internet is down", "r"))
-        f1 = run_scan("NOAA Weather Radio", 162.35, 162.60, "5k", mock) or ""
+        f1 = run_scan("NOAA Weather Radio", 162.335, 162.640, "5k", mock) or ""
         f2 = run_scan("FM broadcast", 88.0, 108.0, "50k", mock) or ""
         answer_rf("Emergency check. Tell the user which emergency info sources are on the air.\n"
                   + f1 + "\n" + f2, q)
