@@ -201,6 +201,28 @@ def find_peaks(pts, margin=10.0, top=5):
     return peaks[:top], floor
 
 LAST = {"pts": [], "label": None}
+BASELINE = {}          # label -> background sweep, used to ignore steady signals
+
+def baseline_power(label, f, tol_mhz):
+    pts = BASELINE.get(label)
+    if not pts: return None
+    near = [p for fr, p in pts if abs(fr - f) <= tol_mhz]
+    return max(near) if near else None
+
+def record_baseline(key, mock):
+    lo, hi, binw, label = PRESETS[key]
+    print(col(f"  [recording background for {label}: don't transmit now]", "d"))
+    pts = sweep(lo, hi, binw, mock)
+    LAST["pts"], LAST["label"] = pts, re.sub(r"\W+", "_", label.lower())
+    if not pts:
+        print(col("  no data from SDR (is it plugged in?)", "r")); return
+    BASELINE[label] = pts
+    peaks, floor = find_peaks(pts)
+    print(f"  background saved for {label}: noise floor {floor:.1f} dB")
+    if peaks:
+        print("  steady signals that will be ignored: " + ", ".join(f"{f:.3f} MHz" for f, _ in peaks))
+    else:
+        print("  no steady signals in the background")
 
 # ---------- EE measurement tools (all math done in code, not by the model) ----------
 def measure(mhz, mock):
@@ -518,6 +540,8 @@ EE tools (computed in code, model only explains):
   fspl 162.55 10            free-space path loss (MHz, km)
   dbm 5w | dbm 30           power unit conversion
   export                    save the last sweep to CSV
+  baseline fob              record the background; later scans show only NEW signals
+  reset baseline            forget all saved backgrounds
 Device (read-only allowlist):
   status                    model, quant, load time, memory, latency, temp, offline check
   gain 30                   change SDR gain (asks for confirmation)
@@ -539,6 +563,9 @@ def route(q):
     m = re.match(r"gain\s+(\d{1,2})", q)
     if m: return ("gain", int(m.group(1)))
     if q.startswith("export"): return ("export",)
+    m = re.match(r"(?:baseline|background)\s+(\w+)", q)
+    if m: return ("baseline", m.group(1)) if m.group(1) in PRESETS else ("help",)
+    if q in ("clear baseline", "baseline clear", "reset baseline"): return ("baseline_clear",)
     m = re.match(r"(?:measure|meas)\s+(\d+(?:\.\d+)?)", q)
     if m:
         mhz = float(m.group(1))
@@ -575,6 +602,16 @@ def run_scan(label, lo, hi, binw, mock):
     peaks, floor = find_peaks(pts)
     if floor is None:
         print(col("  no data from SDR (is it plugged in?)", "r")); return None
+    if label in BASELINE and peaks:
+        tol = max(0.006, (pts[1][0] - pts[0][0]) * 2) if len(pts) > 1 else 0.01
+        kept, ignored = [], []
+        for f, p in peaks:
+            bp = baseline_power(label, f, tol)
+            (ignored if bp is not None and p - bp < 6 else kept).append((f, p))
+        if ignored:
+            print(col("  ignoring background: " + ", ".join(f"{f:.3f} MHz" for f, _ in ignored)
+                      + "  (seen in baseline)", "d"))
+        peaks = kept
     if not peaks:
         print(f"  nothing above the noise floor ({floor:.1f} dB)")
         return f"Scan of {label} ({lo}-{hi} MHz): no signals above the noise floor."
@@ -610,6 +647,9 @@ def dispatch(r, q, mock, notes):
         else:
             print("  cancelled")
     elif r[0] == "export": export_last()
+    elif r[0] == "baseline": record_baseline(r[1], mock)
+    elif r[0] == "baseline_clear":
+        BASELINE.clear(); print("  saved backgrounds cleared")
     elif r[0] == "antenna": antenna(r[1])
     elif r[0] == "fspl": fspl(r[1], r[2])
     elif r[0] == "dbm": dbm_convert(r[1])
