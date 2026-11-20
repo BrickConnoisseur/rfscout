@@ -57,6 +57,45 @@ BANDS = [
     (929.0, 932.0, "Paging", "pager networks"),
 ]
 
+BAND_WORDS = {
+    "NOAA Weather Radio": "weather alert alerts emergency noaa storm tornado forecast forecasts",
+    "433 MHz ISM band": "433 sensor sensors doorbell doorbells remote remotes thermometer",
+    "315 MHz short-range devices": "315 car key fob fobs keyfob garage door opener tire pressure tpms",
+    "FRS/GMRS": "walkie talkie talkies walkietalkie handheld family hiking frs gmrs",
+    "ADS-B": "ads aircraft airplane airplanes plane planes flight flights tracking position 1090",
+    "GPS L1": "gps navigation satellite satellites location",
+    "FM broadcast radio": "music station stations broadcast car radio fm",
+    "Aviation navigation": "vor ils navigation beacon beacons landing",
+    "Aviation voice": "pilot pilots air traffic control atc tower airport aviation",
+    "Weather satellites": "weather satellite satellites images apt meteor",
+    "2 m amateur radio": "ham amateur 2m",
+    "Marine VHF": "boat boats marine ship ships harbor coast",
+    "VHF land mobile": "business utility utilities public safety",
+    "70 cm amateur radio": "ham amateur 70cm",
+    "UHF land mobile": "business utility utilities public safety",
+    "UHF TV": "tv television antenna channels",
+    "700 MHz cellular": "cell cellular phone phones lte 4g 5g",
+    "800 MHz public safety": "police fire firefighters ems ambulance first responders",
+    "850 MHz cellular": "cell cellular phone phones lte 4g",
+    "915 MHz ISM band": "lora iot smart meter meters 915",
+    "Paging": "pager pagers paging hospital",
+}
+
+def select_bands(q, k=2):
+    """Find the band-table rows a question is about (code does the lookup, not the AI)."""
+    words = {w for w in re.findall(r"[a-z0-9]+", q.lower()) if w not in STOP and len(w) > 1}
+    words |= {w[:-1] for w in words if w.endswith("s")}
+    scored = []
+    for lo, hi, name, desc in BANDS:
+        vocab = set(re.findall(r"[a-z0-9]+", (name + " " + desc + " " + BAND_WORDS.get(name, "")).lower()))
+        vocab -= {"and", "the", "from", "with", "radio", "mhz", "band", "like", "of"}
+        sc = len(words & vocab)
+        if sc: scored.append((sc, lo, hi, name, desc))
+    scored.sort(key=lambda x: -x[0])
+    if not scored: return []
+    top = scored[0][0]
+    return [r[1:] for r in scored if r[0] == top][:k]
+
 def lookup(mhz):
     for lo, hi, name, desc in BANDS:
         if lo <= mhz <= hi:
@@ -430,7 +469,22 @@ def answer_rf(facts, query):
     show(text, dt, tps)
     log_metric("rf", query, text, dt, tps)
 
+SYS_BANDS = ("You are RFScout, a radio assistant running offline on a small device. "
+             "Answer the question in 1 or 2 short sentences using ONLY the band table rows given. "
+             "Always state the frequency range in MHz exactly as written. Do not invent frequencies.")
+
 def answer_general(q, notes):
+    rows = select_bands(q)
+    if rows:
+        print(col("  band table:", "y"))
+        for lo, hi, name, desc in rows:
+            print(f"    {col(name, 'y')}  {lo:g}–{hi:g} MHz  {col('(' + desc + ')', 'd')}")
+        facts = "\n".join(f"- {name}: {lo:g} to {hi:g} MHz, used for {desc}." for lo, hi, name, desc in rows)
+        text, dt, tps = llm(SYS_BANDS, f"Band table rows:\n{facts}\n\nQuestion: {q}", max_tokens=60)
+        show(text, dt, tps)
+        print(col("  source: band table (" + ", ".join(r[2] for r in rows) + ")", "d"))
+        log_metric("band-qa", q, text, dt, tps)
+        return
     hits = select_passages(q, notes)
     if hits:
         ctx = "\n".join(f"[note line {n}] {line}" for n, line in hits)
@@ -555,7 +609,7 @@ def route(q):
     q = q.lower().strip()
     if q in ("quit", "exit", "q"): return ("quit",)
     if q in ("help", "?", ""): return ("help",)
-    if q.startswith("band"): return ("bands",)
+    if q.startswith("band") or q in ("table", "show bands", "show band table", "list bands"): return ("bands",)
     if q in ("status", "stats", "stat", "temp", "temperature", "uptime"): return ("status",)
     if q.startswith("selftest") or q == "test": return ("selftest",)
     if q.startswith("bench"): return ("bench",)
@@ -635,7 +689,9 @@ def dispatch(r, q, mock, notes):
     if r[0] == "quit": return False
     elif r[0] == "help": print(HELP)
     elif r[0] == "bands":
-        for lo, hi, name, _ in BANDS: print(f"  {lo:8.3f}–{hi:8.3f} MHz  {name}")
+        print(col(f"  ── local band table: {len(BANDS)} US allocations (ask me about any of them) ──", "b"))
+        for lo, hi, name, desc in sorted(BANDS):
+            print(f"  {lo:8.3f}–{hi:8.3f} MHz  {col(name, 'y')}  {col(desc, 'd')}")
     elif r[0] == "status": print_status(mock)
     elif r[0] == "selftest": selftest()
     elif r[0] == "bench": bench()
